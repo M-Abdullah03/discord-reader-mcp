@@ -3,8 +3,10 @@
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { createServer } from "./tools.js";
 
-// The free Workers plan allows 50 outbound requests per invocation, so keep reads under that.
+// The free Workers plan allows 50 outbound requests per invocation, so keep reads under that, leaving
+// headroom for read_attachment's file download.
 const MAX_MESSAGES = 2000;
+const MAX_REQUESTS = 45;
 
 function unauthorized(message) {
   return new Response(JSON.stringify({ error: message }), {
@@ -24,7 +26,7 @@ export default {
     if (!match) return unauthorized("Send your Discord bot token as 'Authorization: Bearer <token>'.");
 
     const transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
-    await createServer(match[1], { maxMessages: MAX_MESSAGES }).connect(transport);
+    await createServer(match[1], { maxMessages: MAX_MESSAGES, maxRequests: MAX_REQUESTS }).connect(transport);
     return transport.handleRequest(request);
   },
 };

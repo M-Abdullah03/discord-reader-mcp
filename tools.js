@@ -19,9 +19,19 @@ const CHANNEL_TYPES = {
   16: "media",
 };
 
-function makeApi(token) {
-  return async function api(path) {
+// maxRequests caps Discord calls per tool call, so a host's per-request subrequest limit is hit cleanly.
+function makeApi(token, maxRequests = Infinity) {
+  let used = 0;
+  const api = async function api(path) {
     for (let attempt = 0; attempt < 6; attempt++) {
+      if (used >= maxRequests) {
+        const err = new Error(
+          `Stopped after ${maxRequests} Discord requests (this host's per-call limit). Narrow the date range, channels or limit.`,
+        );
+        err.budget = true;
+        throw err;
+      }
+      used++;
       const res = await fetch(API + path, {
         headers: { Authorization: `Bot ${token}`, "User-Agent": "DiscordBot (discord-reader-mcp, 1.0)" },
       });
@@ -40,6 +50,7 @@ function makeApi(token) {
     }
     throw new Error(`Discord API rate limited too many times on ${path}`);
   };
+  return api;
 }
 
 function parseDate(value, name) {
@@ -99,7 +110,8 @@ function fail(e) {
   return { content: [{ type: "text", text: String(e.message ?? e) }], isError: true };
 }
 
-function formatMessage(m, guildId) {
+// lookup holds guild role and channel names (from makeLookup) so <@&id> and <#id> mentions read as names.
+function formatMessage(m, guildId, lookup = {}) {
   const lines = [];
   const author = m.author?.global_name || m.author?.username || "unknown";
   lines.push(`--- [${fmtTime(m.timestamp)}] ${author} (@${m.author?.username}) | msg ${m.id}`);
@@ -107,7 +119,12 @@ function formatMessage(m, guildId) {
   if (m.content) {
     // Swap <@id> mentions for names so role assignments are readable.
     const names = new Map((m.mentions ?? []).map((u) => [u.id, u.global_name || u.username]));
-    lines.push(m.content.replace(/<@!?(\d+)>/g, (raw, id) => (names.has(id) ? `@${names.get(id)}` : raw)));
+    lines.push(
+      m.content
+        .replace(/<@!?(\d+)>/g, (raw, id) => (names.has(id) ? `@${names.get(id)}` : raw))
+        .replace(/<@&(\d+)>/g, (raw, id) => (lookup.roles?.has(id) ? `@${lookup.roles.get(id)}` : raw))
+        .replace(/<#(\d+)>/g, (raw, id) => (lookup.channels?.has(id) ? `#${lookup.channels.get(id)}` : raw)),
+    );
   }
   for (const a of m.attachments ?? []) lines.push(`[attachment] ${a.filename} (${a.content_type ?? "unknown type"}) ${a.url}`);
   for (const e of m.embeds ?? []) {
@@ -118,9 +135,62 @@ function formatMessage(m, guildId) {
   return lines.join("\n");
 }
 
-// maxMessages caps read_messages, e.g. to stay under a host's per-request subrequest limit.
-export function createServer(token, { maxMessages = 5000 } = {}) {
-  const api = makeApi(token);
+// Walks backwards from `beforeDate` (or now) until it passes `afterDate` or hits `limit`. Returns oldest first.
+async function fetchMessages(api, channelId, { afterDate = null, beforeDate = null, limit }) {
+  const collected = [];
+  let cursor = beforeDate ? snowflakeFromDate(beforeDate) : null;
+  let done = false;
+  while (!done && collected.length < limit) {
+    const qs = new URLSearchParams({ limit: "100" });
+    if (cursor) qs.set("before", cursor);
+    const batch = await api(`/channels/${channelId}/messages?${qs}`);
+    if (batch.length === 0) break;
+    for (const m of batch) {
+      if (afterDate && new Date(m.timestamp) < afterDate) {
+        done = true;
+        break;
+      }
+      collected.push(m);
+      if (collected.length >= limit) break;
+    }
+    cursor = batch[batch.length - 1].id;
+    if (batch.length < 100) break;
+  }
+  return collected.reverse();
+}
+
+const TEXT_ATTACHMENT = /\.(txt|md|markdown|csv|tsv|json|log|ya?ml|xml|html?)$/i;
+const MAX_ATTACHMENT_BYTES = 200_000;
+
+// maxMessages caps read_messages; maxRequests caps Discord calls over the server's lifetime. Both exist for hosts
+// with per-request subrequest limits, where a new server is built for every request.
+export function createServer(token, { maxMessages = 5000, maxRequests = Infinity } = {}) {
+  const api = makeApi(token, maxRequests);
+  const guildNames = new Map();
+
+  // Loads role and channel names for a guild, only when messages actually contain those mentions.
+  async function makeLookup(guildId, messages) {
+    const content = messages.map((m) => m.content ?? "").join("\n");
+    const needRoles = /<@&\d+>/.test(content);
+    const needChannels = /<#\d+>/.test(content);
+    if (!guildId || (!needRoles && !needChannels)) return {};
+    const cached = guildNames.get(guildId) ?? {};
+    try {
+      if (needRoles && !cached.roles) cached.roles = new Map((await api(`/guilds/${guildId}/roles`)).map((r) => [r.id, r.name]));
+      if (needChannels && !cached.channels)
+        cached.channels = new Map((await api(`/guilds/${guildId}/channels`)).map((c) => [c.id, c.name]));
+    } catch (e) {
+      if (e.budget) throw e;
+      // Names are a nicety; fall back to raw IDs if they cannot be loaded.
+    }
+    guildNames.set(guildId, cached);
+    return cached;
+  }
+
+  async function formatAll(messages, guildId) {
+    const lookup = await makeLookup(guildId, messages);
+    return messages.map((m) => formatMessage(m, guildId, lookup));
+  }
   const server = new McpServer({ name: "discord-reader", version: "1.0.0" });
   const readOnly = { readOnlyHint: true, openWorldHint: true };
 
@@ -197,32 +267,11 @@ export function createServer(token, { maxMessages = 5000 } = {}) {
           );
         }
 
-        // Walk backwards from `before` (or now) until we pass `after` or hit the limit.
-        const collected = [];
-        let cursor = beforeDate ? snowflakeFromDate(beforeDate) : null;
-        let done = false;
-        while (!done && collected.length < limit) {
-          const qs = new URLSearchParams({ limit: "100" });
-          if (cursor) qs.set("before", cursor);
-          const batch = await api(`/channels/${channel_id}/messages?${qs}`);
-          if (batch.length === 0) break;
-          for (const m of batch) {
-            if (afterDate && new Date(m.timestamp) < afterDate) {
-              done = true;
-              break;
-            }
-            collected.push(m);
-            if (collected.length >= limit) break;
-          }
-          cursor = batch[batch.length - 1].id;
-          if (batch.length < 100) break;
-        }
-
-        collected.reverse();
+        const collected = await fetchMessages(api, channel_id, { afterDate, beforeDate, limit });
         const header = `#${channel.name} (id ${channel.id}): ${collected.length} message(s)${
           collected.length >= limit ? ` (hit limit of ${limit}; narrow the date range or raise limit)` : ""
         }`;
-        return text([header, ...collected.map((m) => formatMessage(m, channel.guild_id))].join("\n\n"));
+        return text([header, ...(await formatAll(collected, channel.guild_id))].join("\n\n"));
       } catch (e) {
         return fail(e);
       }
@@ -258,8 +307,155 @@ export function createServer(token, { maxMessages = 5000 } = {}) {
 
         pins.reverse();
         const header = `#${channel.name} (id ${channel.id}): ${pins.length} pinned message(s)`;
-        const out = pins.map((p) => `${formatMessage(p.message, channel.guild_id)}\n[pinned ${fmtTime(p.pinned_at)}]`);
+        const formatted = await formatAll(
+          pins.map((p) => p.message),
+          channel.guild_id,
+        );
+        const out = formatted.map((f, i) => `${f}\n[pinned ${fmtTime(pins[i].pinned_at)}]`);
         return text([header, ...out].join("\n\n"));
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_message",
+    {
+      description:
+        "Read one message from a Discord message link (or channel and message IDs), with the messages just before and after it for context. Use when the user pastes a discord.com/channels/... link.",
+      inputSchema: {
+        link: z.string().optional().describe("Message link, e.g. https://discord.com/channels/<server>/<channel>/<message>"),
+        channel_id: z.string().optional().describe("Channel or thread ID, if no link is given"),
+        message_id: z.string().optional().describe("Message ID, if no link is given"),
+        context: z.number().int().min(0).max(25).optional().describe("Messages to include before and after (default 5)"),
+      },
+      annotations: readOnly,
+    },
+    async ({ link, channel_id, message_id, context = 5 }) => {
+      try {
+        if (link) {
+          const match = link.match(/discord(?:app)?\.com\/channels\/(?:\d+|@me)\/(\d+)\/(\d+)/);
+          if (!match) return fail(new Error(`Not a Discord message link: ${link}`));
+          [, channel_id, message_id] = match;
+        }
+        if (!channel_id || !message_id) return fail(new Error("Give a message link, or both channel_id and message_id."));
+
+        const channel = await api(`/channels/${channel_id}`);
+        const qs = new URLSearchParams({ around: message_id, limit: String(context * 2 + 1) });
+        const around = (await api(`/channels/${channel_id}/messages?${qs}`)).reverse();
+        if (!around.some((m) => m.id === message_id)) return fail(new Error(`Message ${message_id} not found in #${channel.name}.`));
+
+        const formatted = await formatAll(around, channel.guild_id);
+        const out = formatted.map((f, i) => (around[i].id === message_id ? f.replace(/^---/, ">>> TARGET") : f));
+        return text(
+          [`#${channel.name} (id ${channel.id}): message ${message_id} with ${context} message(s) of context each side`, ...out].join(
+            "\n\n",
+          ),
+        );
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "search_messages",
+    {
+      description:
+        "Find messages containing a keyword or phrase (case-insensitive) in one or more channels or threads, optionally within a date range and by author. Matches message text, embed titles and descriptions, and attachment filenames, and returns only the matches. Bots cannot use Discord's own search, so this scans recent history per channel.",
+      inputSchema: {
+        channel_ids: z.array(z.string()).min(1).max(50).describe("Channel or thread IDs to search"),
+        query: z.string().min(1).describe("Text to look for"),
+        author: z.string().optional().describe("Only messages whose author's username or display name contains this"),
+        after: z.string().optional().describe("Only messages at or after this date/time, ISO 8601"),
+        before: z.string().optional().describe("Only messages before this date/time, ISO 8601"),
+        scan_limit: z.number().int().min(1).max(maxMessages).optional().describe("Most recent messages to scan per channel (default 200)"),
+      },
+      annotations: readOnly,
+    },
+    async ({ channel_ids, query, author, after, before, scan_limit = 200 }) => {
+      let afterDate, beforeDate;
+      try {
+        afterDate = parseDate(after, "after");
+        beforeDate = parseDate(before, "before");
+      } catch (e) {
+        return fail(e);
+      }
+      const q = query.toLowerCase();
+      const who = author?.toLowerCase();
+      const sections = [];
+      const skipped = [];
+      let total = 0;
+      for (const id of channel_ids) {
+        try {
+          const channel = await api(`/channels/${id}`);
+          const messages = await fetchMessages(api, id, { afterDate, beforeDate, limit: scan_limit });
+          const hits = messages.filter((m) => {
+            if (who && ![m.author?.username, m.author?.global_name].some((n) => n?.toLowerCase().includes(who))) return false;
+            const haystack = [
+              m.content,
+              ...(m.embeds ?? []).flatMap((e) => [e.title, e.description]),
+              ...(m.attachments ?? []).map((a) => a.filename),
+            ]
+              .filter(Boolean)
+              .join("\n")
+              .toLowerCase();
+            return haystack.includes(q);
+          });
+          total += hits.length;
+          if (hits.length)
+            sections.push(
+              [`#${channel.name} (id ${id}): ${hits.length} match(es)`, ...(await formatAll(hits, channel.guild_id))].join("\n\n"),
+            );
+        } catch (e) {
+          if (e.budget) {
+            skipped.push(`stopped at channel ${id}: ${e.message}`);
+            break;
+          }
+          skipped.push(`channel ${id}: ${e.message}`);
+        }
+      }
+      const header = `${total} match(es) for "${query}" across ${channel_ids.length} channel(s), scanning up to ${scan_limit} recent message(s) each.`;
+      return text([header, ...sections, ...(skipped.length ? [`Not searched:\n${skipped.join("\n")}`] : [])].join("\n\n"));
+    },
+  );
+
+  server.registerTool(
+    "read_attachment",
+    {
+      description:
+        "Read the contents of a text attachment (.txt, .md, .csv, .json, .log, .yaml, .xml, .html) from a message. Other file types return their details only. Large files are truncated.",
+      inputSchema: {
+        channel_id: z.string().describe("Channel or thread ID of the message"),
+        message_id: z.string().describe("Message ID with the attachment"),
+        filename: z.string().optional().describe("Which attachment, if the message has several (default: the first text one)"),
+      },
+      annotations: readOnly,
+    },
+    async ({ channel_id, message_id, filename }) => {
+      try {
+        // Fetch the message for a fresh signed URL; this also limits reads to files on messages the bot can see.
+        const message = await api(`/channels/${channel_id}/messages/${message_id}`);
+        const attachments = message.attachments ?? [];
+        if (!attachments.length) return fail(new Error("That message has no attachments."));
+        const isText = (a) => TEXT_ATTACHMENT.test(a.filename) || /^text\/|json|xml|yaml/.test(a.content_type ?? "");
+        const file = filename ? attachments.find((a) => a.filename === filename) : (attachments.find(isText) ?? attachments[0]);
+        if (!file) return fail(new Error(`No attachment named ${filename}. Attachments: ${attachments.map((a) => a.filename).join(", ")}`));
+        if (!isText(file)) {
+          return fail(
+            new Error(
+              `${file.filename} (${file.content_type ?? "unknown type"}, ${file.size} bytes) is not a text file, so it cannot be read here. URL: ${file.url}`,
+            ),
+          );
+        }
+
+        const res = await fetch(file.url);
+        if (!res.ok) return fail(new Error(`Could not download ${file.filename}: HTTP ${res.status}`));
+        const body = await res.text();
+        const truncated = body.length > MAX_ATTACHMENT_BYTES;
+        const header = `${file.filename} (${file.size} bytes)${truncated ? `, truncated to the first ${MAX_ATTACHMENT_BYTES} characters` : ""}`;
+        return text(`${header}\n\n${truncated ? body.slice(0, MAX_ATTACHMENT_BYTES) : body}`);
       } catch (e) {
         return fail(e);
       }

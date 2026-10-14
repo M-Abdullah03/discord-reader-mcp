@@ -69,6 +69,8 @@ Open a new Claude Code session and ask, for example:
 | `search_messages` | Keyword search across channels |
 | `read_attachment` | Contents of text attachments (.txt, .md, .csv, ...) |
 
+Claude also receives [INSTRUCTIONS.md](INSTRUCTIONS.md) when it connects, which explains how to use these tools well.
+
 ## For server admins
 
 **Once per server:** give a "Discord Reader" role read access to the channels.

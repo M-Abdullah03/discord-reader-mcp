@@ -1,5 +1,6 @@
 // Read-only Discord MCP tools. Uses a bot token and exposes no write tools.
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { readFileSync } from "node:fs";
 import { z } from "zod";
 
 const API = "https://discord.com/api/v10";
@@ -152,6 +153,9 @@ const MAX_ATTACHMENT_BYTES = 200_000;
 
 const MAX_MESSAGES = 5000;
 
+// Guidance for the model, sent to the client when it connects.
+const INSTRUCTIONS = readFileSync(new URL("./INSTRUCTIONS.md", import.meta.url), "utf8");
+
 export function createServer(token) {
   const api = makeApi(token);
   const guildNames = new Map();
@@ -178,7 +182,7 @@ export function createServer(token) {
     const lookup = await makeLookup(guildId, messages);
     return messages.map((m) => formatMessage(m, guildId, lookup));
   }
-  const server = new McpServer({ name: "discord-reader", version: "1.0.0" });
+  const server = new McpServer({ name: "discord-reader", version: "1.0.0" }, { instructions: INSTRUCTIONS });
   const readOnly = { readOnlyHint: true, openWorldHint: true };
 
   server.registerTool(

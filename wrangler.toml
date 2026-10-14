@@ -1,0 +1,9 @@
+name = "discord-reader-mcp"
+main = "worker.js"
+compatibility_date = "2026-10-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Request logs would include nothing sensitive (tokens are in headers, which are not logged),
+# but keep logging off so no request data is retained.
+[observability]
+enabled = false

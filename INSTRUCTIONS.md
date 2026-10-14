@@ -3,7 +3,7 @@ Read-only access to Discord through the user's own bot. You can read; you cannot
 Finding things
 - Get IDs from list_servers, then list_channels. Never guess a server, channel or thread ID.
 - A pasted discord.com/channels/... link: use get_message on it.
-- Looking for a keyword, topic or person: use search_messages on the relevant channels instead of reading them in full.
+- Looking for a keyword, topic or person: use search_messages on the relevant channels instead of reading them in full. It scans only the latest scan_limit messages per channel (default 200). If the result says INCOMPLETE, older matches may exist: raise scan_limit or narrow with after/before before concluding something is not there.
 - Threads and forum posts are channels with their own ID. Use list_threads on the parent channel, then read_messages or read_pins on the thread ID. A forum itself has no messages, only threads.
 - Pins often hold a channel's key context (specs, links, decisions). Check read_pins when you need background.
 

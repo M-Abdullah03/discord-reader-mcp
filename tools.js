@@ -124,28 +124,29 @@ function formatMessage(m, guildId, lookup = {}) {
   return lines.join("\n");
 }
 
-// Walks backwards from `beforeDate` (or now) until it passes `afterDate` or hits `limit`. Returns oldest first.
+// Walks backwards from `beforeDate` (or now) until it passes `afterDate` or hits `limit`. Returns messages oldest
+// first, and `complete: false` when `limit` cut it off while older messages in the range may remain.
 async function fetchMessages(api, channelId, { afterDate = null, beforeDate = null, limit }) {
   const collected = [];
+  const inRange = (m) => !afterDate || new Date(m.timestamp) >= afterDate;
   let cursor = beforeDate ? snowflakeFromDate(beforeDate) : null;
-  let done = false;
-  while (!done && collected.length < limit) {
+  for (;;) {
     const qs = new URLSearchParams({ limit: "100" });
     if (cursor) qs.set("before", cursor);
     const batch = await api(`/channels/${channelId}/messages?${qs}`);
-    if (batch.length === 0) break;
-    for (const m of batch) {
-      if (afterDate && new Date(m.timestamp) < afterDate) {
-        done = true;
-        break;
-      }
+    for (const [i, m] of batch.entries()) {
+      if (!inRange(m)) return { messages: collected.reverse(), complete: true };
       collected.push(m);
-      if (collected.length >= limit) break;
+      if (collected.length >= limit) {
+        // Unknown if this was the last message in range, unless the batch shows what comes next.
+        const next = batch[i + 1];
+        const complete = next ? !inRange(next) : batch.length < 100;
+        return { messages: collected.reverse(), complete };
+      }
     }
+    if (batch.length < 100) return { messages: collected.reverse(), complete: true };
     cursor = batch[batch.length - 1].id;
-    if (batch.length < 100) break;
   }
-  return collected.reverse();
 }
 
 const TEXT_ATTACHMENT = /\.(txt|md|markdown|csv|tsv|json|log|ya?ml|xml|html?)$/i;
@@ -258,9 +259,9 @@ export function createServer(token) {
           );
         }
 
-        const collected = await fetchMessages(api, channel_id, { afterDate, beforeDate, limit });
+        const { messages: collected, complete } = await fetchMessages(api, channel_id, { afterDate, beforeDate, limit });
         const header = `#${channel.name} (id ${channel.id}): ${collected.length} message(s)${
-          collected.length >= limit ? ` (hit limit of ${limit}; narrow the date range or raise limit)` : ""
+          complete ? "" : ` (hit limit of ${limit}; older messages exist, so narrow the date range or raise limit)`
         }`;
         return text([header, ...(await formatAll(collected, channel.guild_id))].join("\n\n"));
       } catch (e) {
@@ -377,11 +378,13 @@ export function createServer(token) {
       const who = author?.toLowerCase();
       const sections = [];
       const skipped = [];
+      const partial = [];
       let total = 0;
       for (const id of channel_ids) {
         try {
           const channel = await api(`/channels/${id}`);
-          const messages = await fetchMessages(api, id, { afterDate, beforeDate, limit: scan_limit });
+          const { messages, complete } = await fetchMessages(api, id, { afterDate, beforeDate, limit: scan_limit });
+          if (!complete) partial.push(`#${channel.name} (id ${id}): searched back to ${fmtTime(messages[0].timestamp)}`);
           const hits = messages.filter((m) => {
             if (who && ![m.author?.username, m.author?.global_name].some((n) => n?.toLowerCase().includes(who))) return false;
             const haystack = [
@@ -403,8 +406,20 @@ export function createServer(token) {
           skipped.push(`channel ${id}: ${e.message}`);
         }
       }
-      const header = `${total} match(es) for "${query}" across ${channel_ids.length} channel(s), scanning up to ${scan_limit} recent message(s) each.`;
-      return text([header, ...sections, ...(skipped.length ? [`Not searched:\n${skipped.join("\n")}`] : [])].join("\n\n"));
+      const range = after ? "in the date range" : "in the channel's history";
+      const header =
+        `${total} match(es) for "${query}" across ${channel_ids.length} channel(s), scanning up to ${scan_limit} message(s) each.` +
+        (partial.length
+          ? ` INCOMPLETE: ${partial.length} channel(s) have older messages ${range} that were not searched (listed at the end).`
+          : "");
+      const parts = [header, ...sections];
+      if (skipped.length) parts.push(`Could not search:\n${skipped.join("\n")}`);
+      if (partial.length) {
+        parts.push(
+          `Not fully searched, older matches may exist. To cover them, raise scan_limit (max ${MAX_MESSAGES}) or set after/before:\n${partial.join("\n")}`,
+        );
+      }
+      return text(parts.join("\n\n"));
     },
   );
 

@@ -1,5 +1,4 @@
 // Read-only Discord MCP tools. Uses a bot token and exposes no write tools.
-// Shared by the local stdio server (server.js) and the hosted worker (worker.js).
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
@@ -19,19 +18,9 @@ const CHANNEL_TYPES = {
   16: "media",
 };
 
-// maxRequests caps Discord calls per tool call, so a host's per-request subrequest limit is hit cleanly.
-function makeApi(token, maxRequests = Infinity) {
-  let used = 0;
-  const api = async function api(path) {
+function makeApi(token) {
+  return async function api(path) {
     for (let attempt = 0; attempt < 6; attempt++) {
-      if (used >= maxRequests) {
-        const err = new Error(
-          `Stopped after ${maxRequests} Discord requests (this host's per-call limit). Narrow the date range, channels or limit.`,
-        );
-        err.budget = true;
-        throw err;
-      }
-      used++;
       const res = await fetch(API + path, {
         headers: { Authorization: `Bot ${token}`, "User-Agent": "DiscordBot (discord-reader-mcp, 1.0)" },
       });
@@ -50,7 +39,6 @@ function makeApi(token, maxRequests = Infinity) {
     }
     throw new Error(`Discord API rate limited too many times on ${path}`);
   };
-  return api;
 }
 
 function parseDate(value, name) {
@@ -162,10 +150,10 @@ async function fetchMessages(api, channelId, { afterDate = null, beforeDate = nu
 const TEXT_ATTACHMENT = /\.(txt|md|markdown|csv|tsv|json|log|ya?ml|xml|html?)$/i;
 const MAX_ATTACHMENT_BYTES = 200_000;
 
-// maxMessages caps read_messages; maxRequests caps Discord calls over the server's lifetime. Both exist for hosts
-// with per-request subrequest limits, where a new server is built for every request.
-export function createServer(token, { maxMessages = 5000, maxRequests = Infinity } = {}) {
-  const api = makeApi(token, maxRequests);
+const MAX_MESSAGES = 5000;
+
+export function createServer(token) {
+  const api = makeApi(token);
   const guildNames = new Map();
 
   // Loads role and channel names for a guild, only when messages actually contain those mentions.
@@ -179,8 +167,7 @@ export function createServer(token, { maxMessages = 5000, maxRequests = Infinity
       if (needRoles && !cached.roles) cached.roles = new Map((await api(`/guilds/${guildId}/roles`)).map((r) => [r.id, r.name]));
       if (needChannels && !cached.channels)
         cached.channels = new Map((await api(`/guilds/${guildId}/channels`)).map((c) => [c.id, c.name]));
-    } catch (e) {
-      if (e.budget) throw e;
+    } catch {
       // Names are a nicety; fall back to raw IDs if they cannot be loaded.
     }
     guildNames.set(guildId, cached);
@@ -252,7 +239,7 @@ export function createServer(token, { maxMessages = 5000, maxRequests = Infinity
         channel_id: z.string().describe("Channel or thread ID"),
         after: z.string().optional().describe("Only messages at or after this date/time, ISO 8601 (e.g. 2026-09-15)"),
         before: z.string().optional().describe("Only messages before this date/time, ISO 8601"),
-        limit: z.number().int().min(1).max(maxMessages).optional().describe(`Max messages to return (default 500, max ${maxMessages})`),
+        limit: z.number().int().min(1).max(MAX_MESSAGES).optional().describe(`Max messages to return (default 500, max ${MAX_MESSAGES})`),
       },
       annotations: readOnly,
     },
@@ -370,7 +357,7 @@ export function createServer(token, { maxMessages = 5000, maxRequests = Infinity
         author: z.string().optional().describe("Only messages whose author's username or display name contains this"),
         after: z.string().optional().describe("Only messages at or after this date/time, ISO 8601"),
         before: z.string().optional().describe("Only messages before this date/time, ISO 8601"),
-        scan_limit: z.number().int().min(1).max(maxMessages).optional().describe("Most recent messages to scan per channel (default 200)"),
+        scan_limit: z.number().int().min(1).max(MAX_MESSAGES).optional().describe("Most recent messages to scan per channel (default 200)"),
       },
       annotations: readOnly,
     },
@@ -409,10 +396,6 @@ export function createServer(token, { maxMessages = 5000, maxRequests = Infinity
               [`#${channel.name} (id ${id}): ${hits.length} match(es)`, ...(await formatAll(hits, channel.guild_id))].join("\n\n"),
             );
         } catch (e) {
-          if (e.budget) {
-            skipped.push(`stopped at channel ${id}: ${e.message}`);
-            break;
-          }
           skipped.push(`channel ${id}: ${e.message}`);
         }
       }

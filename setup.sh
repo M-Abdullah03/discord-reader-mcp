@@ -7,13 +7,14 @@ DIR="$(pwd)"
 need() { command -v "$1" >/dev/null || { echo "Missing $1. $2" >&2; exit 1; }; }
 need node "Install Node.js (LTS) from https://nodejs.org"
 need claude "Install Claude Code from https://claude.com/claude-code"
+need security "This setup is for macOS."
 
 echo "Installing dependencies..."
 npm install --omit=dev --silent
 
 # Reuse a saved token unless --new-token is passed.
 TOKEN=""
-if command -v security >/dev/null && [ "$1" != "--new-token" ]; then
+if [ "$1" != "--new-token" ]; then
   TOKEN="$(security find-generic-password -s discord-bot-token -w 2>/dev/null || true)"
   [ -n "$TOKEN" ] && echo "Using the bot token saved in your Keychain (run with --new-token to replace it)."
 fi
@@ -38,14 +39,10 @@ console.log(guilds.length ? `Servers: ${guilds.map((g) => g.name).join(", ")}` :
 if (!(app.flags & ((1 << 18) | (1 << 19)))) console.log("WARNING: Message Content Intent is off, so messages will look empty. Turn it on in the Bot page.");
 '
 
-if command -v security >/dev/null; then
-  [ -n "$NEW_TOKEN" ] && security add-generic-password -U -a "$USER" -s discord-bot-token -w "$TOKEN"
-  ENV_ARGS=()
-else
-  # No Keychain outside macOS: the token is stored in Claude Code's config instead.
-  ENV_ARGS=(-e "DISCORD_BOT_TOKEN=$TOKEN")
+if [ -n "$NEW_TOKEN" ]; then
+  security add-generic-password -U -a "$USER" -s discord-bot-token -w "$TOKEN"
 fi
 
 claude mcp remove discord-reader -s user >/dev/null 2>&1 || true
-claude mcp add discord-reader -s user "${ENV_ARGS[@]}" -- "$DIR/run.sh" >/dev/null
+claude mcp add discord-reader -s user -- "$DIR/run.sh" >/dev/null
 echo "Done. Open a new Claude Code session and ask it about your Discord server."

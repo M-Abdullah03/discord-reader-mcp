@@ -55,8 +55,6 @@ Open a new Claude Code session and ask, for example:
 
 - **Update:** `git pull && ./setup.sh`
 - **Replace the token:** `./setup.sh --new-token`
-- **Linux:** same steps. The token is stored in Claude Code's settings instead of a Keychain.
-- **Windows:** use WSL.
 
 ## Tools
 
